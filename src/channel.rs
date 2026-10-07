@@ -77,7 +77,11 @@ pub struct SendFuture<T> {
     value: Option<T>,
 }
 
-impl<T: Unpin> Future for SendFuture<T> {
+// `value` is only ever moved in and out, never pinned, so the future can be
+// `Unpin` whatever `T` is.
+impl<T> Unpin for SendFuture<T> {}
+
+impl<T> Future for SendFuture<T> {
     type Output = Result<(), T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -111,9 +115,12 @@ pub struct Receiver<T> {
 impl<T> Receiver<T> {
     /// Receive the next value, suspending while the channel is empty. Resolves
     /// to `None` once all senders are gone and the buffer is drained.
-    pub fn recv(&self) -> RecvFuture<T> {
+    ///
+    /// Takes `&mut self` so only one `recv` can be pending at a time: the
+    /// channel stores a single receiver waker.
+    pub fn recv(&mut self) -> RecvFuture<'_, T> {
         RecvFuture {
-            shared: self.shared.clone(),
+            shared: &self.shared,
         }
     }
 }
@@ -130,11 +137,11 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-pub struct RecvFuture<T> {
-    shared: Arc<Mutex<Shared<T>>>,
+pub struct RecvFuture<'a, T> {
+    shared: &'a Mutex<Shared<T>>,
 }
 
-impl<T> Future for RecvFuture<T> {
+impl<T> Future for RecvFuture<'_, T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -142,10 +149,13 @@ impl<T> Future for RecvFuture<T> {
         let mut shared = this.shared.lock().unwrap();
 
         if let Some(v) = shared.queue.pop_front() {
-            // Freed a slot: wake one parked sender before returning the value.
-            let waker = shared.send_wakers.pop_front();
+            // Freed a slot: wake every parked sender, not just the first. A
+            // parked waker may be stale (its future was re-polled or dropped),
+            // and waking only that one would strand the senders behind it.
+            // Senders that lose the race for the slot simply park again.
+            let wakers: Vec<Waker> = shared.send_wakers.drain(..).collect();
             drop(shared);
-            if let Some(w) = waker {
+            for w in wakers {
                 w.wake();
             }
             Poll::Ready(Some(v))
@@ -161,12 +171,12 @@ impl<T> Future for RecvFuture<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{run_blocking, spawn};
+    use crate::{run_blocking, spawn, yield_now};
 
     #[test]
     fn send_then_receive_in_order() {
         let result = run_blocking(async {
-            let (tx, rx) = bounded_channel::<i32>(4);
+            let (tx, mut rx) = bounded_channel::<i32>(4);
             spawn(async move {
                 for i in 0..5 {
                     tx.send(i).await.unwrap();
@@ -187,7 +197,7 @@ mod tests {
         // capacity 1, send 3 values: the sender must suspend until the receiver
         // drains, exercising the send-parking path.
         let result = run_blocking(async {
-            let (tx, rx) = bounded_channel::<i32>(1);
+            let (tx, mut rx) = bounded_channel::<i32>(1);
             spawn(async move {
                 for i in 0..3 {
                     tx.send(i).await.unwrap();
@@ -200,5 +210,41 @@ mod tests {
             sum
         });
         assert_eq!(result, 3); // 0 + 1 + 2
+    }
+
+    /// Polls the inner future twice per poll. Legal (combinators like `join!`
+    /// re-poll freely), but it makes a blocked send register its waker twice.
+    struct PollTwice<F>(Pin<Box<F>>);
+
+    impl<F: Future> Future for PollTwice<F> {
+        type Output = F::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+            match self.0.as_mut().poll(cx) {
+                Poll::Ready(v) => Poll::Ready(v),
+                Poll::Pending => self.0.as_mut().poll(cx),
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_sender_waker_does_not_strand_others() {
+        let result = run_blocking(async {
+            let (tx, mut rx) = bounded_channel::<i32>(1);
+            let tx2 = tx.clone();
+            tx.send(0).await.unwrap(); // fill the only slot
+            spawn(PollTwice(Box::pin(
+                async move { tx.send(1).await.unwrap() },
+            )));
+            spawn(async move { tx2.send(2).await.unwrap() });
+            yield_now().await; // let both senders park
+
+            let mut got = Vec::new();
+            while let Some(v) = rx.recv().await {
+                got.push(v);
+            }
+            got
+        });
+        assert_eq!(result, vec![0, 1, 2]);
     }
 }

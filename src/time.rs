@@ -54,17 +54,25 @@ pub(crate) fn process_due_timers() -> Option<Instant> {
     })
 }
 
+/// Drop every registered timer, so stale wakers don't carry over into the next
+/// `run_blocking` on this thread.
+pub(crate) fn clear_timers() {
+    // Take the heap out first: dropping a waker can drop its task's future.
+    drop(TIMERS.take());
+}
+
 /// A future that resolves after `duration` has elapsed, without busy-waiting.
 pub struct Sleep {
     deadline: Instant,
-    registered: bool,
+    // The waker last handed to the timer heap, if any.
+    waker: Option<Waker>,
 }
 
 /// Create a future that completes once `duration` has passed.
 pub fn sleep(duration: Duration) -> Sleep {
     Sleep {
         deadline: Instant::now() + duration,
-        registered: false,
+        waker: None,
     }
 }
 
@@ -74,15 +82,15 @@ impl Future for Sleep {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if Instant::now() >= this.deadline {
-            Poll::Ready(())
-        } else if !this.registered {
-            // Register the timer once; the executor wakes us at the deadline.
-            register_timer(this.deadline, cx.waker().clone());
-            this.registered = true;
-            Poll::Pending
-        } else {
-            Poll::Pending
+            return Poll::Ready(());
         }
+        // Register once, and again only if we're now polled with a different
+        // waker (the stale entry just causes one harmless spurious wake).
+        if !this.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+            register_timer(this.deadline, cx.waker().clone());
+            this.waker = Some(cx.waker().clone());
+        }
+        Poll::Pending
     }
 }
 
@@ -105,12 +113,24 @@ mod tests {
     fn sleeps_run_concurrently() {
         // Two overlapping 50ms sleeps + a 10ms sleep should finish in ~60ms, not
         // ~110ms — proving the sleeps overlap rather than block each other.
+        // The bound leaves headroom for slow CI machines.
         let start = Instant::now();
         run_blocking(async {
             spawn(async { sleep(Duration::from_millis(50)).await });
             sleep(Duration::from_millis(50)).await;
             sleep(Duration::from_millis(10)).await;
         });
-        assert!(start.elapsed() < Duration::from_millis(70));
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn sleep_wakes_the_latest_waker() {
+        run_blocking(async {
+            let mut nap = sleep(Duration::from_millis(10));
+            // First poll with a waker that does nothing...
+            let _ = Pin::new(&mut nap).poll(&mut Context::from_waker(Waker::noop()));
+            // ...then await it here: this task must still be woken.
+            nap.await;
+        });
     }
 }

@@ -28,7 +28,7 @@ fn main() {
 
         // 2. Producer/consumer over a capacity-2 channel: the producer suspends
         //    once the buffer fills until the consumer drains it.
-        let (tx, rx) = bounded_channel::<i32>(2);
+        let (tx, mut rx) = bounded_channel::<i32>(2);
 
         let producer = spawn(async move {
             for n in 0..5 {
