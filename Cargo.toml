@@ -1,6 +1,11 @@
 [package]
-name = "async_runtime"
+name = "mini-async-runtime"
 version = "0.1.0"
 edition = "2021"
+description = "A minimal single-threaded async runtime built only on the standard library"
+license = "MIT"
+repository = "https://github.com/abdogad/mini-async-runtime"
+readme = "README.md"
+publish = false
 
 [dependencies]

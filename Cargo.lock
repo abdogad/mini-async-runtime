@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "async_runtime"
+name = "mini-async-runtime"
 version = "0.1.0"

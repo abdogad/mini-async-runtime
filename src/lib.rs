@@ -2,7 +2,7 @@
 //!
 //! ```
 //! use std::time::Duration;
-//! use async_runtime::{bounded_channel, run_blocking, sleep, spawn};
+//! use mini_async_runtime::{bounded_channel, run_blocking, sleep, spawn};
 //!
 //! let sum = run_blocking(async {
 //!     let (tx, mut rx) = bounded_channel(2);

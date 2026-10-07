@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use async_runtime::{bounded_channel, run_blocking, sleep, spawn};
+use mini_async_runtime::{bounded_channel, run_blocking, sleep, spawn};
 
 fn main() {
     let start = Instant::now();
